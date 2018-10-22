@@ -1,103 +1,504 @@
-#include "tensorflow/cc/client/client_session.h"
-#include "tensorflow/cc/ops/standard_ops.h"
-#include "tensorflow/core/framework/tensor.h"
-#include "tensorflow/cc/framework/gradients.h"
+/*----------------------------------------------------------------------
+  PuReMD - Purdue ReaxFF Molecular Dynamics Program
 
-#include "data_set.h"
+  Copyright (2010) Purdue University
+  Hasan Metin Aktulga, hmaktulga@lbl.gov
+  Joseph Fogarty, jcfogart@mail.usf.edu
+  Sagar Pandit, pandit@usf.edu
+  Ananth Y Grama, ayg@cs.purdue.edu
 
-using namespace tensorflow;
-using namespace tensorflow::ops;
+  Please cite the related publication:
+  H. M. Aktulga, J. C. Fogarty, S. A. Pandit, A. Y. Grama,
+  "Parallel Reactive Molecular Dynamics: Numerical Methods and
+  Algorithmic Techniques", Parallel Computing, in press.
+
+  This program is free software; you can redistribute it and/or
+  modify it under the terms of the GNU General Public License as
+  published by the Free Software Foundation; either version 2 of
+  the License, or (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+  See the GNU General Public License for more details:
+  <http://www.gnu.org/licenses/>.
+  ----------------------------------------------------------------------*/
+#include <tensorflow/core/platform/env.h>
+#include <tensorflow/core/public/session.h>
+#include <iostream>
+#include <time.h>
+#include <sys/time.h>
+
+#include "pair_reaxc.h"
+#include "reaxc_types.h"
+#include "reaxc_nonbonded.h"
+#include "reaxc_bond_orders.h"
+#include "reaxc_list.h"
+#include "reaxc_vector.h"
+
 using namespace std;
+using namespace LAMMPS_NS;
+using namespace tensorflow;
 
-int main() {
-  DataSet data_set("tensorflow/cc/models/", "normalized_car_features.csv");
-  Tensor x_data(DataTypeToEnum<float>::v(),
-                TensorShape{static_cast<int>(data_set.x().size())/3, 3});
-  copy_n(data_set.x().begin(), data_set.x().size(),
-         x_data.flat<float>().data());
+extern struct timeval start_bp8, end_bp8;
+extern double bp8;
 
-  Tensor y_data(DataTypeToEnum<float>::v(),
-                TensorShape{static_cast<int>(data_set.y().size()), 1});
-  copy_n(data_set.y().begin(), data_set.y().size(),
-         y_data.flat<float>().data());
-
-  Scope scope = Scope::NewRootScope();
-
-  auto x = Placeholder(scope, DT_FLOAT);
-  auto y = Placeholder(scope, DT_FLOAT);
-
-  // weights init
-  auto w1 = Variable(scope, {3, 3}, DT_FLOAT);
-  auto assign_w1 = Assign(scope, w1, RandomNormal(scope, {3, 3}, DT_FLOAT));
-
-  auto w2 = Variable(scope, {3, 2}, DT_FLOAT);
-  auto assign_w2 = Assign(scope, w2, RandomNormal(scope, {3, 2}, DT_FLOAT));
-
-  auto w3 = Variable(scope, {2, 1}, DT_FLOAT);
-  auto assign_w3 = Assign(scope, w3, RandomNormal(scope, {2, 1}, DT_FLOAT));
-
-  // bias init
-  auto b1 = Variable(scope, {1, 3}, DT_FLOAT);
-  auto assign_b1 = Assign(scope, b1, RandomNormal(scope, {1, 3}, DT_FLOAT));
-
-  auto b2 = Variable(scope, {1, 2}, DT_FLOAT);
-  auto assign_b2 = Assign(scope, b2, RandomNormal(scope, {1, 2}, DT_FLOAT));
-
-  auto b3 = Variable(scope, {1, 1}, DT_FLOAT);
-  auto assign_b3 = Assign(scope, b3, RandomNormal(scope, {1, 1}, DT_FLOAT));
-
-  // layers
-  auto layer_1 = Tanh(scope, Tanh(scope, Add(scope, MatMul(scope, x, w1), b1)));
-  auto layer_2 = Tanh(scope, Add(scope, MatMul(scope, layer_1, w2), b2));
-  auto layer_3 = Tanh(scope, Add(scope, MatMul(scope, layer_2, w3), b3));
-
-  // regularization
-  auto regularization = AddN(scope,
-                             initializer_list<Input>{L2Loss(scope, w1),
-                                                     L2Loss(scope, w2),
-                                                     L2Loss(scope, w3)});
-
-  // loss calculation
-  auto loss = Add(scope,
-                  ReduceMean(scope, Square(scope, Sub(scope, layer_3, y)), {0, 1}),
-                  Mul(scope, Cast(scope, 0.01,  DT_FLOAT), regularization));
-
-  // add the gradients operations to the graph
-  std::vector<Output> grad_outputs;
-  TF_CHECK_OK(AddSymbolicGradients(scope, {loss}, {w1, w2, w3, b1, b2, b3}, &grad_outputs));
-
-  // update the weights and bias using gradient descent
-  auto apply_w1 = ApplyGradientDescent(scope, w1, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[0]});
-  auto apply_w2 = ApplyGradientDescent(scope, w2, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[1]});
-  auto apply_w3 = ApplyGradientDescent(scope, w3, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[2]});
-  auto apply_b1 = ApplyGradientDescent(scope, b1, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[3]});
-  auto apply_b2 = ApplyGradientDescent(scope, b2, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[4]});
-  auto apply_b3 = ApplyGradientDescent(scope, b3, Cast(scope, 0.01,  DT_FLOAT), {grad_outputs[5]});
-
-  ClientSession session(scope);
-  std::vector<Tensor> outputs;
+void vdW_Coulomb_Energy( reax_system *system, control_params *control,
+                         simulation_data *data, storage *workspace,
+                         reax_list **lists, output_controls * /*out_control*/ )
+{
+  int i, j, pj, natoms;
+  int start_i, end_i, flag;
+  rc_tagint orig_i, orig_j;
+  double p_vdW1, p_vdW1i;
+  double powr_vdW1, powgi_vdW1;
+  double tmp, r_ij, fn13, exp1, exp2;
+  double Tap, dTap, dfn13, CEvd, CEclmb, de_core;
+  double dr3gamij_1, dr3gamij_3;
+  double e_ele, e_vdW, e_core, SMALL = 0.0001;
+  double e_lg, de_lg, r_ij5, r_ij6, re6;
+  rvec temp, ext_press;
+  two_body_parameters *twbp;
+  far_neighbor_data *nbr_pj;
+  reax_list *far_nbrs;
+ 
   
-  // init the weights and biases by running the assigns nodes once
-  TF_CHECK_OK(session.Run({assign_w1, assign_w2, assign_w3, assign_b1, assign_b2, assign_b3}, nullptr));
+  int mlflag = 1;// use a ml model when flag =1 and continue original code when flag = 0;
+ 
   
-  // training steps
-  for (int i = 0; i < 5000; ++i) {
-    if (i % 100 == 0) {
-      TF_CHECK_OK(session.Run({{x, x_data}, {y, y_data}}, {loss}, &outputs));
-      std::cout << "Loss after " << i << " steps " << outputs[0].scalar<float>() << std::endl;
+  // Tallying variables:
+  double pe_vdw, f_tmp, delij[3];
+
+  natoms = system->n;
+  far_nbrs = (*lists) + FAR_NBRS;
+  p_vdW1 = system->reax_param.gp.l[28];
+  p_vdW1i = 1.0 / p_vdW1;
+  e_core = 0;
+  e_vdW = 0;
+  e_lg = de_lg = 0.0;
+
+  for( i = 0; i < natoms; ++i ) {
+    if (system->my_atoms[i].type < 0) continue;
+    start_i = Start_Index(i, far_nbrs);
+    end_i   = End_Index(i, far_nbrs);
+    orig_i  = system->my_atoms[i].orig_id;
+
+    for( pj = start_i; pj < end_i; ++pj ) {
+      nbr_pj = &(far_nbrs->select.far_nbr_list[pj]);
+      j = nbr_pj->nbr;
+      if (system->my_atoms[j].type < 0) continue;
+      orig_j  = system->my_atoms[j].orig_id;
+
+      flag = 0;
+      if(nbr_pj->d <= control->nonb_cut) {
+        if (j < natoms) flag = 1;
+        else if (orig_i < orig_j) flag = 1;
+        else if (orig_i == orig_j) {
+          if (nbr_pj->dvec[2] > SMALL) flag = 1;
+          else if (fabs(nbr_pj->dvec[2]) < SMALL) {
+            if (nbr_pj->dvec[1] > SMALL) flag = 1;
+            else if (fabs(nbr_pj->dvec[1]) < SMALL && nbr_pj->dvec[0] > SMALL)
+              flag = 1;
+          }
+        }
+      }
+
+      if (flag) {
+        if (mlflag == 1){
+          gettimeofday( &start_bp8, NULL );
+          //construct a ML graph;
+          tensorflow::Session* session;
+          tensorflow::Status status = NewSession(SessionOptions(), &session);
+          if (!status.ok()) {
+            std::cout << status.ToString() << "\n";
+          }
+          // Read in the protobuf graph we exported
+          // (The path seems to be relative to the cwd. Keep this in mind
+          // when using `bazel run` since the cwd isn't where you call
+          // `bazel run` but from inside a temp folder.)
+          GraphDef graph_def;
+          status = tensorflow::ReadBinaryProto(Env::Default(), "./graph.pb", &graph_def);
+          if (!status.ok()) {
+            std::cout << status.ToString() << "\n";
+          }
+         // Add the graph to the session
+          status = session->Create(graph_def);
+          if (!status.ok()) {
+            std::cout << status.ToString() << "\n";
+          }
+		Tensor a(DT_FLOAT, TensorShape({7}));
+		  a.vec<float>()(0) = nbr_pj->d;
+		  a.vec<float>()(1) = twbp->gamma;
+		  a.vec<float>()(2) = twbp->D;
+		  a.vec<float>()(3) = twbp->alpha;
+		  a.vec<float>()(4) = twbp->r_vdW;
+		  a.vec<float>()(5) = twbp->lgcij;
+		  a.vec<float>()(6) = twbp->gamma_w;
+		  std::vector<std::pair<string, tensorflow::Tensor>> inputs = {
+			{ "a", a },
+		  };
+		  std::vector<tensorflow::Tensor> outputs;
+		  // Run the session, evaluating our "c" operation from the graph
+		  status = session->Run(inputs, {"c"}, {}, &outputs);
+		  if (!status.ok()) {
+			std::cout << status.ToString() << "\n";
+		  }
+		
+		  auto data->my_en.e_vdW = outputs[0].scalar<float>();
+		  data->my_en.e_ele = outputs[1].scalar<float>();
+		  CEvd = tf.to_double(outputs[2].scalar<float>();
+		  CEclmb = outputs[3].scalar<float>();
+		  
+		  // Free any resources used by the session
+		  session->Close();
+          gettimeofday( &end_bp8, NULL );
+          bp8 = bp8 + 1000000 * (end_bp8.tv_sec - start_bp8.tv_sec) + end_bp8.tv_usec - start_bp8.tv_usec;
+		  
+       }else{
+          r_ij = nbr_pj->d;
+          twbp = &(system->reax_param.tbp[ system->my_atoms[i].type ]
+                                           [ system->my_atoms[j].type ]);
+
+          Tap = workspace->Tap[7] * r_ij + workspace->Tap[6];
+          Tap = Tap * r_ij + workspace->Tap[5];
+          Tap = Tap * r_ij + workspace->Tap[4];
+          Tap = Tap * r_ij + workspace->Tap[3];
+          Tap = Tap * r_ij + workspace->Tap[2];
+          Tap = Tap * r_ij + workspace->Tap[1];
+          Tap = Tap * r_ij + workspace->Tap[0];
+
+          dTap = 7*workspace->Tap[7] * r_ij + 6*workspace->Tap[6];
+          dTap = dTap * r_ij + 5*workspace->Tap[5];
+          dTap = dTap * r_ij + 4*workspace->Tap[4];
+          dTap = dTap * r_ij + 3*workspace->Tap[3];
+          dTap = dTap * r_ij + 2*workspace->Tap[2];
+          dTap += workspace->Tap[1]/r_ij;
+
+
+
+          /*vdWaals Calculations*/
+          if(system->reax_param.gp.vdw_type==1 || system->reax_param.gp.vdw_type==3)
+            { // shielding
+              powr_vdW1 = pow(r_ij, p_vdW1);
+              powgi_vdW1 = pow( 1.0 / twbp->gamma_w, p_vdW1);
+
+              fn13 = pow( powr_vdW1 + powgi_vdW1, p_vdW1i );
+              exp1 = exp( twbp->alpha * (1.0 - fn13 / twbp->r_vdW) );
+              exp2 = exp( 0.5 * twbp->alpha * (1.0 - fn13 / twbp->r_vdW) );
+
+              e_vdW = twbp->D * (exp1 - 2.0 * exp2);
+              data->my_en.e_vdW += Tap * e_vdW;
+
+              dfn13 = pow( powr_vdW1 + powgi_vdW1, p_vdW1i - 1.0) *
+                pow(r_ij, p_vdW1 - 2.0);
+
+              CEvd = dTap * e_vdW -
+                Tap * twbp->D * (twbp->alpha / twbp->r_vdW) * (exp1 - exp2) * dfn13;
+            }
+          else{ // no shielding
+            exp1 = exp( twbp->alpha * (1.0 - r_ij / twbp->r_vdW) );
+            exp2 = exp( 0.5 * twbp->alpha * (1.0 - r_ij / twbp->r_vdW) );
+
+            e_vdW = twbp->D * (exp1 - 2.0 * exp2);
+            data->my_en.e_vdW += Tap * e_vdW;
+
+            CEvd = dTap * e_vdW -
+              Tap * twbp->D * (twbp->alpha / twbp->r_vdW) * (exp1 - exp2) / r_ij;
+          }
+
+          if(system->reax_param.gp.vdw_type==2 || system->reax_param.gp.vdw_type==3)
+            { // inner wall
+              e_core = twbp->ecore * exp(twbp->acore * (1.0-(r_ij/twbp->rcore)));
+              data->my_en.e_vdW += Tap * e_core;
+
+              de_core = -(twbp->acore/twbp->rcore) * e_core;
+              CEvd += dTap * e_core + Tap * de_core / r_ij;
+
+              //  lg correction, only if lgvdw is yes
+              if (control->lgflag) {
+                r_ij5 = pow( r_ij, 5.0 );
+                r_ij6 = pow( r_ij, 6.0 );
+                re6 = pow( twbp->lgre, 6.0 );
+                e_lg = -(twbp->lgcij/( r_ij6 + re6 ));
+                data->my_en.e_vdW += Tap * e_lg;
+
+                de_lg = -6.0 * e_lg *  r_ij5 / ( r_ij6 + re6 ) ;
+                CEvd += dTap * e_lg + Tap * de_lg / r_ij;
+              }
+
+            }
+
+          /*Coulomb Calculations*/
+          dr3gamij_1 = ( r_ij * r_ij * r_ij + twbp->gamma );
+          dr3gamij_3 = pow( dr3gamij_1 , 0.33333333333333 );
+
+          tmp = Tap / dr3gamij_3;
+          data->my_en.e_ele += e_ele =
+            C_ele * system->my_atoms[i].q * system->my_atoms[j].q * tmp;
+
+          CEclmb = C_ele * system->my_atoms[i].q * system->my_atoms[j].q *
+            ( dTap -  Tap * r_ij / dr3gamij_1 ) / dr3gamij_3;
+
+        }
+
+     
+
+      /* tally into per-atom energy */
+      if( system->pair_ptr->evflag || system->pair_ptr->vflag_atom) {
+        pe_vdw = Tap * (e_vdW + e_core + e_lg);
+        rvec_ScaledSum( delij, 1., system->my_atoms[i].x,
+                              -1., system->my_atoms[j].x );
+        f_tmp = -(CEvd + CEclmb);
+        system->pair_ptr->ev_tally(i,j,natoms,1,pe_vdw,e_ele,
+                        f_tmp,delij[0],delij[1],delij[2]);
+      }
+
+      if( control->virial == 0 ) {
+        rvec_ScaledAdd( workspace->f[i], -(CEvd + CEclmb), nbr_pj->dvec );
+        rvec_ScaledAdd( workspace->f[j], +(CEvd + CEclmb), nbr_pj->dvec );
+      }
+      else { /* NPT, iNPT or sNPT */
+        rvec_Scale( temp, CEvd + CEclmb, nbr_pj->dvec );
+
+        rvec_ScaledAdd( workspace->f[i], -1., temp );
+        rvec_Add( workspace->f[j], temp );
+
+        rvec_iMultiply( ext_press, nbr_pj->rel_box, temp );
+        rvec_Add( data->my_ext_press, ext_press );
+      }
+      }
     }
-    // nullptr because the output from the run is useless
-    TF_CHECK_OK(session.Run({{x, x_data}, {y, y_data}}, {apply_w1, apply_w2, apply_w3, apply_b1, apply_b2, apply_b3}, nullptr));
   }
 
-  // prediction using the trained neural net
-  TF_CHECK_OK(session.Run({{x, {data_set.input(110000.f, Fuel::DIESEL, 7.f)}}}, {layer_3}, &outputs));
-  cout << "DNN output: " << *outputs[0].scalar<float>().data() << endl;
-  std::cout << "Price predicted " << data_set.output(*outputs[0].scalar<float>().data()) << " euros" << std::endl;
+  Compute_Polarization_Energy( system, data );
+}
 
-  // saving the model
-  //GraphDef graph_def;
-  //TF_ASSERT_OK(scope.ToGraphDef(&graph_def));
 
-  return 0;
+
+void Tabulated_vdW_Coulomb_Energy( reax_system *system,control_params *control,
+                                   simulation_data *data, storage *workspace,
+                                   reax_list **lists,
+                                   output_controls * /*out_control*/ )
+{
+  int i, j, pj, r, natoms;
+  int type_i, type_j, tmin, tmax;
+  int start_i, end_i, flag;
+  rc_tagint orig_i, orig_j;
+  double r_ij, base, dif;
+  double e_vdW, e_ele;
+  double CEvd, CEclmb, SMALL = 0.0001;
+  double f_tmp, delij[3];
+
+  rvec temp, ext_press;
+  far_neighbor_data *nbr_pj;
+  reax_list *far_nbrs;
+  LR_lookup_table *t;
+
+  natoms = system->n;
+  far_nbrs = (*lists) + FAR_NBRS;
+
+  e_ele = e_vdW = 0;
+
+  for( i = 0; i < natoms; ++i ) {
+    type_i  = system->my_atoms[i].type;
+    if (type_i < 0) continue;
+    start_i = Start_Index(i,far_nbrs);
+    end_i   = End_Index(i,far_nbrs);
+    orig_i  = system->my_atoms[i].orig_id;
+
+    for( pj = start_i; pj < end_i; ++pj ) {
+      nbr_pj = &(far_nbrs->select.far_nbr_list[pj]);
+      j = nbr_pj->nbr;
+      type_j = system->my_atoms[j].type;
+      if (type_j < 0) continue;
+      orig_j  = system->my_atoms[j].orig_id;
+
+      flag = 0;
+      if(nbr_pj->d <= control->nonb_cut) {
+        if (j < natoms) flag = 1;
+        else if (orig_i < orig_j) flag = 1;
+        else if (orig_i == orig_j) {
+          if (nbr_pj->dvec[2] > SMALL) flag = 1;
+          else if (fabs(nbr_pj->dvec[2]) < SMALL) {
+            if (nbr_pj->dvec[1] > SMALL) flag = 1;
+            else if (fabs(nbr_pj->dvec[1]) < SMALL && nbr_pj->dvec[0] > SMALL)
+              flag = 1;
+          }
+        }
+      }
+
+      if (flag) {
+
+      r_ij   = nbr_pj->d;
+      tmin  = MIN( type_i, type_j );
+      tmax  = MAX( type_i, type_j );
+      t = &( LR[tmin][tmax] );
+
+      /* Cubic Spline Interpolation */
+      r = (int)(r_ij * t->inv_dx);
+      if( r == 0 )  ++r;
+      base = (double)(r+1) * t->dx;
+      dif = r_ij - base;
+
+      e_vdW = ((t->vdW[r].d*dif + t->vdW[r].c)*dif + t->vdW[r].b)*dif +
+        t->vdW[r].a;
+
+      e_ele = ((t->ele[r].d*dif + t->ele[r].c)*dif + t->ele[r].b)*dif +
+        t->ele[r].a;
+      e_ele *= system->my_atoms[i].q * system->my_atoms[j].q;
+
+      data->my_en.e_vdW += e_vdW;
+      data->my_en.e_ele += e_ele;
+
+      CEvd = ((t->CEvd[r].d*dif + t->CEvd[r].c)*dif + t->CEvd[r].b)*dif +
+        t->CEvd[r].a;
+
+      CEclmb = ((t->CEclmb[r].d*dif+t->CEclmb[r].c)*dif+t->CEclmb[r].b)*dif +
+        t->CEclmb[r].a;
+      CEclmb *= system->my_atoms[i].q * system->my_atoms[j].q;
+
+      /* tally into per-atom energy */
+      if( system->pair_ptr->evflag || system->pair_ptr->vflag_atom) {
+        rvec_ScaledSum( delij, 1., system->my_atoms[i].x,
+                              -1., system->my_atoms[j].x );
+        f_tmp = -(CEvd + CEclmb);
+        system->pair_ptr->ev_tally(i,j,natoms,1,e_vdW,e_ele,
+                        f_tmp,delij[0],delij[1],delij[2]);
+      }
+
+      if( control->virial == 0 ) {
+        rvec_ScaledAdd( workspace->f[i], -(CEvd + CEclmb), nbr_pj->dvec );
+        rvec_ScaledAdd( workspace->f[j], +(CEvd + CEclmb), nbr_pj->dvec );
+      }
+      else { // NPT, iNPT or sNPT
+        rvec_Scale( temp, CEvd + CEclmb, nbr_pj->dvec );
+
+        rvec_ScaledAdd( workspace->f[i], -1., temp );
+        rvec_Add( workspace->f[j], temp );
+
+        rvec_iMultiply( ext_press, nbr_pj->rel_box, temp );
+        rvec_Add( data->my_ext_press, ext_press );
+      }
+      }
+    }
+  }
+
+  Compute_Polarization_Energy( system, data );
+}
+
+
+
+void Compute_Polarization_Energy( reax_system *system, simulation_data *data )
+{
+  int  i, type_i;
+  double q, en_tmp;
+
+  data->my_en.e_pol = 0.0;
+  for( i = 0; i < system->n; i++ ) {
+    type_i = system->my_atoms[i].type;
+    if (type_i < 0) continue;
+    q = system->my_atoms[i].q;
+
+    en_tmp = KCALpMOL_to_EV * (system->reax_param.sbp[type_i].chi * q +
+                (system->reax_param.sbp[type_i].eta / 2.) * SQR(q));
+    data->my_en.e_pol += en_tmp;
+
+    /* tally into per-atom energy */
+    if( system->pair_ptr->evflag)
+      system->pair_ptr->ev_tally(i,i,system->n,1,0.0,en_tmp,0.0,0.0,0.0,0.0);
+  }
+}
+
+void LR_vdW_Coulomb( reax_system *system, storage *workspace,
+        control_params *control, int i, int j, double r_ij, LR_data *lr )
+{
+  double p_vdW1 = system->reax_param.gp.l[28];
+  double p_vdW1i = 1.0 / p_vdW1;
+  double powr_vdW1, powgi_vdW1;
+  double tmp, fn13, exp1, exp2;
+  double Tap, dTap, dfn13;
+  double dr3gamij_1, dr3gamij_3;
+  double e_core, de_core;
+  double e_lg, de_lg, r_ij5, r_ij6, re6;
+  two_body_parameters *twbp;
+
+  twbp = &(system->reax_param.tbp[i][j]);
+  e_core = 0;
+  de_core = 0;
+  e_lg = de_lg = 0.0;
+
+  /* calculate taper and its derivative */
+  Tap = workspace->Tap[7] * r_ij + workspace->Tap[6];
+  Tap = Tap * r_ij + workspace->Tap[5];
+  Tap = Tap * r_ij + workspace->Tap[4];
+  Tap = Tap * r_ij + workspace->Tap[3];
+  Tap = Tap * r_ij + workspace->Tap[2];
+  Tap = Tap * r_ij + workspace->Tap[1];
+  Tap = Tap * r_ij + workspace->Tap[0];
+
+  dTap = 7*workspace->Tap[7] * r_ij + 6*workspace->Tap[6];
+  dTap = dTap * r_ij + 5*workspace->Tap[5];
+  dTap = dTap * r_ij + 4*workspace->Tap[4];
+  dTap = dTap * r_ij + 3*workspace->Tap[3];
+  dTap = dTap * r_ij + 2*workspace->Tap[2];
+  dTap += workspace->Tap[1]/r_ij;
+
+  /*vdWaals Calculations*/
+  if(system->reax_param.gp.vdw_type==1 || system->reax_param.gp.vdw_type==3)
+    { // shielding
+      powr_vdW1 = pow(r_ij, p_vdW1);
+      powgi_vdW1 = pow( 1.0 / twbp->gamma_w, p_vdW1);
+
+      fn13 = pow( powr_vdW1 + powgi_vdW1, p_vdW1i );
+      exp1 = exp( twbp->alpha * (1.0 - fn13 / twbp->r_vdW) );
+      exp2 = exp( 0.5 * twbp->alpha * (1.0 - fn13 / twbp->r_vdW) );
+
+      lr->e_vdW = Tap * twbp->D * (exp1 - 2.0 * exp2);
+
+      dfn13 = pow( powr_vdW1 + powgi_vdW1, p_vdW1i-1.0) * pow(r_ij, p_vdW1-2.0);
+
+      lr->CEvd = dTap * twbp->D * (exp1 - 2.0 * exp2) -
+        Tap * twbp->D * (twbp->alpha / twbp->r_vdW) * (exp1 - exp2) * dfn13;
+    }
+  else{ // no shielding
+    exp1 = exp( twbp->alpha * (1.0 - r_ij / twbp->r_vdW) );
+    exp2 = exp( 0.5 * twbp->alpha * (1.0 - r_ij / twbp->r_vdW) );
+
+    lr->e_vdW = Tap * twbp->D * (exp1 - 2.0 * exp2);
+    lr->CEvd = dTap * twbp->D * (exp1 - 2.0 * exp2) -
+      Tap * twbp->D * (twbp->alpha / twbp->r_vdW) * (exp1 - exp2) / r_ij;
+  }
+
+  if(system->reax_param.gp.vdw_type==2 || system->reax_param.gp.vdw_type==3)
+    { // inner wall
+      e_core = twbp->ecore * exp(twbp->acore * (1.0-(r_ij/twbp->rcore)));
+      lr->e_vdW += Tap * e_core;
+
+      de_core = -(twbp->acore/twbp->rcore) * e_core;
+      lr->CEvd += dTap * e_core + Tap * de_core / r_ij;
+
+      //  lg correction, only if lgvdw is yes
+      if (control->lgflag) {
+        r_ij5 = pow( r_ij, 5.0 );
+        r_ij6 = pow( r_ij, 6.0 );
+        re6 = pow( twbp->lgre, 6.0 );
+        e_lg = -(twbp->lgcij/( r_ij6 + re6 ));
+        lr->e_vdW += Tap * e_lg;
+
+        de_lg = -6.0 * e_lg *  r_ij5 / ( r_ij6 + re6 ) ;
+        lr->CEvd += dTap * e_lg + Tap * de_lg/r_ij;
+      }
+
+    }
+
+
+  /* Coulomb calculations */
+  dr3gamij_1 = ( r_ij * r_ij * r_ij + twbp->gamma );
+  dr3gamij_3 = pow( dr3gamij_1 , 0.33333333333333 );
+
+  tmp = Tap / dr3gamij_3;
+  lr->H = EV_to_KCALpMOL * tmp;
+  lr->e_ele = C_ele * tmp;
+
+  lr->CEclmb = C_ele * ( dTap -  Tap * r_ij / dr3gamij_1 ) / dr3gamij_3;
 }
